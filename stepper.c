@@ -44,20 +44,21 @@
 #include <string.h>
 #include <math.h>
 
-#define MAX_AXIS 8
+#include "stepper.h"
+
 #define BUFFER_SIZE 32
 
 
 
 typedef struct {
     uint32_t direction_bits;
-    int32_t steps[MAX_AXIS];
+    int32_t steps[MAX_AXIS]; // signed since it is also used to calculate delta
     int32_t total_steps;
     int32_t step_position;
     
 
-    float vmax_sq;     //[(mm/timestep)^2]
-    float vmax_end_sq; //[(mm/timestep)^2]
+    float vmax_sq;       //[(mm/timestep)^2]
+    float vmax_entry_sq; //[(mm/timestep)^2]
 } stepper_block_t;
 
 
@@ -132,6 +133,112 @@ int stepper_put_buffer(stepper_block_t *block) {
     return 0;
 }
 
+#define DT 0.001f // TODO derive from ChibiOS tick frequency
+
+static const float dt = DT; // 1/systick_freq
+
+#define STEPS_PER_MM (32*400.0f/40.0f)
+static float steps_per_mm = STEPS_PER_MM;
+static float mm_per_step = 1.0f/STEPS_PER_MM;
+static float vmax = 80.0f * DT * STEPS_PER_MM;          // mm/s to steps / t_systick
+static float amax = 150.0f  * DT * DT * STEPS_PER_MM;         // mm/(s^2) to steps / (t_systick^2)
+static float vmin = 0.1f * DT * STEPS_PER_MM;
+static float junction_deviation = 0.1f * STEPS_PER_MM; // junction deviation in steps
+
+int32_t prev_move_target_steps[MAX_AXIS]={0,0,0,0,0,0,0,0};
+float prev_move_unit_vec[MAX_AXIS]={0,0,0,0,0,0,0,0};
+
+static inline float limit(float x, float y) { return (y<x) ? y : x; } // TODO same as limit
+static inline float sq(float x) { return x*x; }
+static inline float maxf(float x, float y) { return (x>y) ? x : y; }
+static inline int32_t maxi(int32_t x, int32_t y) { return (x>y) ? x : y; }
+
+int stepper_queuemove(float target[], float vmax) {
+    unsigned int next_head = buffer_next_index(buffer_head);
+
+    if (next_head == buffer_tail) return -1; //buffer was full
+    
+    int32_t target_steps[MAX_AXIS];
+    int32_t axis_steps;
+    stepper_block_t block;
+    int i;
+    
+    int32_t block_steps = 0;
+    float distance_sq = 0.0f, distance, inv_distance;
+    float unit_vec[MAX_AXIS];
+    
+    for(i=0; i< stepper_config.naxis; i++) {
+        // Convert target from mm to steps
+        target_steps[i] = lroundf(stepper_config.steps_per_mm[i] * target[i]);
+        axis_steps = block.steps[i] = target_steps[i] - prev_move_target_steps[i];
+    
+        // Compute vector first, divide by distance later
+        unit_vec[i] = axis_steps / stepper_config.steps_per_mm[i];        
+        distance_sq += sq(unit_vec[i]);
+          
+        if (axis_steps<0) axis_steps = -axis_steps;
+        block_steps = maxi(block_steps, axis_steps); // keep max of axis_steps
+
+    }
+    
+    if (block_steps == 0) {
+        // no steps at all, return OK (ignore very small motions without steps)
+        return 0;
+    }
+    
+    distance = sqrtf(distance_sq);
+    inv_distance = 1/distance;
+    
+    // In principle, block_steps is determined by machine_steps_per_mm *
+    // distance (i.e. distance expressed in steps), but ensure this is never
+    // lower than any block.steps[i] (could be due to round-off)
+    block_steps = maxi(block_steps, distance * stepper_config.machine_steps_per_mm);
+    block.total_steps = block_steps;
+    
+    // TODO: compute vmax based on axis limits 
+    // convert vmax from mm/s to mm/tick
+    block.vmax_sq = sq(vmax * DT * stepper_config.machine_steps_per_mm);
+    
+    // Compute unit vector and cosine of angle with previous segment
+    float cos_angle = 0.0f;
+    for(i=0; i<stepper_config.naxis; i++) {
+        unit_vec[i] *= inv_distance;
+        cos_angle -= unit_vec[i] * prev_move_unit_vec[i];
+    } 
+    
+    if (cos_angle > 0.99999f) {
+        block.vmax_entry_sq = sq(vmin);
+    } else {
+        float sin_angle_div2;
+
+        cos_angle = maxf(cos_angle, -0.99999f);  // TODO: is max a macro? or what type is it?
+        sin_angle_div2 = sqrtf(0.5f * (1.0f - cos_angle));
+        
+        block.vmax_entry_sq = maxf(vmin*vmin,
+                (amax*junction_deviation*sin_angle_div2) / (1.0f-sin_angle_div2));
+    }
+    
+
+    // update block: make steps absolute and generate dir mask
+    block.direction_bits = 0;
+    for (i=0; i<stepper_config.naxis; i++) {
+        if (block.steps[i]<0) {
+            block.direction_bits |= stepper_config.dir_mask[i];
+            block.steps[i] = -block.steps[i];
+        }
+    }
+    
+    // store target_steps and unit_vec if block put into buffer succesfully
+    int result;
+    result = stepper_put_buffer(&block);
+    if (result == 0) {
+        memcpy(prev_move_target_steps, target_steps, sizeof(target_steps));
+        memcpy(prev_move_unit_vec, unit_vec, sizeof(unit_vec));
+    }
+    return result;
+}
+
+
 
 /*
  Current state of the stepper algorithm
@@ -148,32 +255,18 @@ typedef struct {
 
 static stepper_status_t st;
 
+
 /*
  Hardware configuration of the machine: I/O mapping of the axes
 */
-typedef struct {
-    int naxis;
-    uint32_t step_mask[MAX_AXIS];
-    uint32_t dir_mask[MAX_AXIS];
-} stepper_config_t;
-
 stepper_config_t stepper_config = {
     naxis: 2,
     step_mask: {BIT(22), BIT(24), 0,0,0,0,0,0},
     dir_mask: {BIT(23), BIT(25), 0,0,0,0,0,0},
+    steps_per_mm: {32.0f*400/40, 32.0f*400/40, 0,0,0,0,0,0},
+    machine_steps_per_mm: STEPS_PER_MM
 };
-
-
-
-
-static const float dt = 0.001f;
-
-static float vmax = 80.0f * 0.001f;              // mm/timestep
-static float steps_per_mm = (32*400.0f/40.0f);
-static float mm_per_step = (40.0f/(32*400.0f));
-static float amax = 100.0f  * 0.001f * 0.001f;         // mm/(timestep^2)
-float current_speed;
-unsigned int test_ctr = 0;
+char* stepper_config_structdef = "naxis:I,step_mask:8I,dir_mask:8I,machine_steps_per_mm:f";
 
 
 void stepper_init(void) {
@@ -187,47 +280,64 @@ void stepper_init(void) {
     stepper_put_buffer(&block);
     st.current_block = &buffer[0];
     
+    float target[MAX_AXIS];
+    
     /* testing code */
     for(int i=0;i<4;i++) {
-        block.direction_bits = 0;
+        target[0] = 80;
+        target[1] = 0;
+        stepper_queuemove(target, 80.0f);
+        if(i==1) break;
+        target[0] = 82;
+        stepper_queuemove(target, 80.0f);
+        target[0] = 160;
+        stepper_queuemove(target, 20.0f);
+        target[1] = 160;
+        stepper_queuemove(target, 80.0f);
+        target[0] = 200;
+        target[1] = 160;
+        stepper_queuemove(target, 80.0f);
+        
+    
+/*        block.direction_bits = stepper_config.dir_mask[0] | stepper_config.dir_mask[1];
         block.steps[0] = 20000;
         block.steps[1] = 0;
         block.total_steps = 20000;
-        block.vmax_sq = vmax*vmax;
-        block.vmax_end_sq = vmax*vmax;
+        block.vmax_sq = sq(vmax);
+        block.vmax_entry_sq = 0;
         stepper_put_buffer(&block);
-        if (i == 1) break;
-        block.direction_bits = 0;
+        //if (i == 1) break;
+        block.direction_bits = stepper_config.dir_mask[0] | stepper_config.dir_mask[1];
         block.steps[0] = 200;
         block.steps[1] = 0;
         block.total_steps = 200;
-        block.vmax_sq = vmax*vmax;
-        block.vmax_end_sq = vmax*vmax/16;
+        block.vmax_sq = sq(vmax);
+        block.vmax_entry_sq = sq(vmax);
         stepper_put_buffer(&block);
         
-        block.direction_bits = 0;
+        block.direction_bits = stepper_config.dir_mask[0] | stepper_config.dir_mask[1];
         block.steps[0] = 10000;
         block.steps[1] = 0;
         block.total_steps = 10000;
-        block.vmax_sq = vmax*vmax/16;
-        block.vmax_end_sq = 0;
+        block.vmax_sq = sq(vmax)/16;
+        block.vmax_entry_sq = sq(vmax)/16;
         stepper_put_buffer(&block);
         
-        block.direction_bits = 0;
+        block.direction_bits = stepper_config.dir_mask[0] | stepper_config.dir_mask[1];
         block.steps[0] = 0;
         block.steps[1] = 20000;
         block.total_steps = 20000;
-        block.vmax_sq = vmax*vmax;
-        block.vmax_end_sq = 0;
+        block.vmax_sq = sq(vmax);
+        block.vmax_entry_sq = 0;
         stepper_put_buffer(&block);
     
-        block.direction_bits = stepper_config.dir_mask[0] | stepper_config.dir_mask[1];
+        block.direction_bits = 0;
         block.steps[0] = 20000;
         block.steps[1] = 20000;
         block.total_steps = 20000;
-        block.vmax_sq = vmax*vmax;
-        block.vmax_end_sq = 0;
-        stepper_put_buffer(&block);
+        block.vmax_sq = sq(vmax);
+        block.vmax_entry_sq = 0;
+        stepper_put_buffer(&block);*/
     }
     
 
@@ -266,9 +376,7 @@ static inline void dmb(void) {
 }
 
 
-static inline float limit(float x, float y) { return (y<x) ? y : x; }
 
-static inline float sq(float x) { return x*x; }
 
 
 /*
@@ -288,7 +396,7 @@ static inline float sq(float x) { return x*x; }
 */
 
 void app_systick(void) {
-
+    static float current_speed = 0;
     unsigned int my_buffer_tail;
     stepper_block_t *bl;
     
@@ -314,11 +422,7 @@ void app_systick(void) {
     // do not accelerate beyond this block's max velocity
     new_speed_sq = limit(new_speed_sq, bl->vmax_sq);
     
-    // compute max current speed in order to be able to decellerate
-    // to bl->vmax_end_sq before reaching end of this block
-    speed_limit_sq = 2*amax*cumulative_steps*mm_per_step + bl->vmax_end_sq;
-    new_speed_sq = limit(new_speed_sq, speed_limit_sq);
-    
+
     // Loop through the buffer from current to the future
     unsigned int i;
     i = buffer_next_index(my_buffer_tail);
@@ -327,19 +431,19 @@ void app_systick(void) {
         bl = &buffer[i];
 
         // compute max current speed in order to be able to decellerate to
-        // bl_vmax_end_sq before reaching end of block bl
-        cumulative_steps += bl->total_steps;
-    
-        speed_limit_sq = 2*amax*cumulative_steps*mm_per_step + bl->vmax_end_sq;
+        // bl->vmax_entry_sq before reaching start of block bl
+
+        speed_limit_sq = 2*amax*cumulative_steps + bl->vmax_entry_sq;
         new_speed_sq = limit(new_speed_sq, speed_limit_sq);
+        
+        cumulative_steps += bl->total_steps;
         
         i=buffer_next_index(i);
     }
     
     // be prepared to stop at the end of the buffer
-    speed_limit_sq = 2*amax*cumulative_steps*mm_per_step;
+    speed_limit_sq = 2*amax*cumulative_steps;
     new_speed_sq = limit(new_speed_sq, speed_limit_sq);    
-    
     
     // Compute the timer reload value for the found speed
     uint32_t reload_value;
@@ -348,7 +452,7 @@ void app_systick(void) {
     if (current_speed < 0.001) { // todo determine appropriate value
         reload_value = 10000;
     } else {
-        reload_value = (1000*mm_per_step) / current_speed;
+        reload_value = 1000 / current_speed;
         if (reload_value>10000) reload_value = 10000; //minimum 100 steps/s
     }
     
@@ -383,12 +487,12 @@ void FiqHandler(void) {
             for (int i = 0; i< stepper_config.naxis; i++) {
                 st.accu[i]=-accu_init;
             }
+            
+            // Set direction signals
+            GPCLR0 = st.all_dir_mask & ~bl->direction_bits;    
+            GPSET0 = bl->direction_bits;
         }
     }
-
-    // Set direction signals
-    GPCLR0 = st.all_dir_mask & ~bl->direction_bits;    
-    GPSET0 = bl->direction_bits;
     
     // Determine which axes to step
     step_mask = 0;    
