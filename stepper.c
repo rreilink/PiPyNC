@@ -141,7 +141,7 @@ static const float dt = DT; // 1/systick_freq
 static float steps_per_mm = STEPS_PER_MM;
 static float mm_per_step = 1.0f/STEPS_PER_MM;
 static float vmax = 80.0f * DT * STEPS_PER_MM;          // mm/s to steps / t_systick
-static float amax = 150.0f  * DT * DT * STEPS_PER_MM;         // mm/(s^2) to steps / (t_systick^2)
+static float amax = 600.0f  * DT * DT * STEPS_PER_MM;         // mm/(s^2) to steps / (t_systick^2)
 static float vmin = 0.1f * DT * STEPS_PER_MM;
 static float junction_deviation = 0.1f * STEPS_PER_MM; // junction deviation in steps
 
@@ -284,6 +284,7 @@ void stepper_init(void) {
     
     /* testing code */
     for(int i=0;i<4;i++) {
+        break;
         target[0] = 80;
         target[1] = 0;
         stepper_queuemove(target, 80.0f);
