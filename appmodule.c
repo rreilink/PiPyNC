@@ -36,10 +36,68 @@ _app_setspeed(PyObject *self, PyObject *args) {
 }
 
 
+static PyObject *
+_app_moveto(PyObject *self, PyObject *args) {
+    float target_f[MAX_AXIS]; // TODO: number of axes
+    PyObject *target;
+    PyObject *iter;
+    PyObject *item;
+    int i;
+    float vmax;
+    
+    for(int i=0;i<MAX_AXIS;i++) target_f[i] = 0.0f;
+
+    if (!PyArg_ParseTuple(args, "Of", &target, &vmax)) {
+        return NULL;
+    } 
+
+    // Iterate over target, convert items to float
+    iter = PyObject_GetIter(target);
+    if (!iter) return NULL; //target is not iterable
+
+    for(i=0;i<stepper_config.naxis;i++) {
+        item = PyIter_Next(iter);
+        if (item==NULL) {
+            if (!PyErr_Occurred()) {
+                // No error, but end of iterator too early
+                PyErr_SetString(PyExc_ValueError, "too few items in target");
+            }
+            goto error;
+        }
+        target_f[i] = PyFloat_AsDouble(item);
+        if (PyErr_Occurred()) goto error;
+        Py_DECREF(item);
+        
+    }
+    
+    // Check that the iterator is exhausted when naxis items have been popped
+    item = PyIter_Next(iter);
+    if (PyErr_Occurred()) goto error;
+    if (item != NULL) {
+        PyErr_SetString(PyExc_ValueError, "too many items in target");
+        goto error;
+    }
+    
+    Py_DECREF(iter);
+    
+    // Perform the move
+    if (stepper_queuemove(target_f, vmax)!=0) { // Error
+        PyErr_SetString(PyExc_RuntimeError, "Queue full");
+        return NULL;
+    }
+
+    Py_RETURN_NONE;
+    
+error:
+    Py_XDECREF(item);
+    Py_XDECREF(iter);
+    
+    return NULL;
+}
 
 
 static PyObject *
-_app_moveto(PyObject *self, PyObject *args) {
+_app_moveto2(PyObject *self, PyObject *args) {
     float target[MAX_AXIS]; // TODO: number of axes
     int i;
     float vmax;
@@ -70,7 +128,7 @@ static PyMethodDef _AppMethods[] = {
 
 static struct PyModuleDef _appmodule = {
     PyModuleDef_HEAD_INIT,
-    "app",   /* name of module */
+    "_app",   /* name of module */
     NULL, /* module documentation, may be NULL */
     -1,       /* size of per-interpreter state of the module,
                  or -1 if the module keeps state in global variables. */

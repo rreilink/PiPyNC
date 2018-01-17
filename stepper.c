@@ -48,6 +48,9 @@
 
 #define BUFFER_SIZE 32
 
+#define DT 0.001f // TODO derive from ChibiOS tick frequency
+#define STEPS_PER_MM (32*400.0f/40.0f)
+
 
 
 typedef struct {
@@ -60,6 +63,37 @@ typedef struct {
     float vmax_sq;       //[(mm/timestep)^2]
     float vmax_entry_sq; //[(mm/timestep)^2]
 } stepper_block_t;
+
+
+/*
+ Current state of the stepper algorithm
+ 
+*/
+
+typedef struct {
+    stepper_block_t *current_block;
+    int32_t accu[MAX_AXIS];         //Bresenham accumulator
+    
+    uint32_t all_step_mask; // binary OR of all step_masks; initialized by stepper_init
+    uint32_t all_dir_mask;  // binary OR of all dir_masks; initialized by stepper_init
+} stepper_status_t;
+
+static stepper_status_t st;
+/*
+ Hardware configuration of the machine: I/O mapping of the axes
+*/
+stepper_config_t stepper_config = {
+    naxis: 2,
+    step_mask: {BIT(22), BIT(24), 0,0,0,0,0,0},
+    dir_mask: {BIT(23), BIT(25), 0,0,0,0,0,0},
+    core_axes: {0, 1},
+    steps_per_mm: {32.0f*400/40, 32.0f*400/40, 0,0,0,0,0,0},
+    machine_steps_per_mm: STEPS_PER_MM,
+    max_acceleration: 1200.0f,
+};
+char* stepper_config_structdef = "naxis:I,step_mask:8I,dir_mask:8I,core_axes:2I,"
+                                 "steps_per_mm:8f,machine_steps_per_mm:f,"
+                                 "max_acceleration:f";
 
 
 /* 
@@ -133,15 +167,9 @@ int stepper_put_buffer(stepper_block_t *block) {
     return 0;
 }
 
-#define DT 0.001f // TODO derive from ChibiOS tick frequency
 
 static const float dt = DT; // 1/systick_freq
 
-#define STEPS_PER_MM (32*400.0f/40.0f)
-static float steps_per_mm = STEPS_PER_MM;
-static float mm_per_step = 1.0f/STEPS_PER_MM;
-static float vmax = 80.0f * DT * STEPS_PER_MM;          // mm/s to steps / t_systick
-static float amax = 600.0f  * DT * DT * STEPS_PER_MM;         // mm/(s^2) to steps / (t_systick^2)
 static float vmin = 0.1f * DT * STEPS_PER_MM;
 static float junction_deviation = 0.1f * STEPS_PER_MM; // junction deviation in steps
 
@@ -166,6 +194,25 @@ int stepper_queuemove(float target[], float vmax) {
     int32_t block_steps = 0;
     float distance_sq = 0.0f, distance, inv_distance;
     float unit_vec[MAX_AXIS];
+    
+    // compute amax in steps per (systick_period^2)
+    float amax = stepper_config.max_acceleration  * DT * DT * stepper_config.machine_steps_per_mm;
+    
+    // core_xy etc conversion
+    if (stepper_config.core_axes[0] >= 0 && stepper_config.core_axes[0]< stepper_config.naxis
+        && stepper_config.core_axes[1] >= 0 && stepper_config.core_axes[1]< stepper_config.naxis) {
+     
+        float a1, a2;
+        a1 = target[stepper_config.core_axes[0]];
+        a2 = target[stepper_config.core_axes[1]];
+        
+        // TODO: rescaling?
+        target[stepper_config.core_axes[0]] = a1 + a2;
+        target[stepper_config.core_axes[1]] = a1 - a2;
+  
+    }
+    
+    
     
     for(i=0; i< stepper_config.naxis; i++) {
         // Convert target from mm to steps
@@ -240,33 +287,6 @@ int stepper_queuemove(float target[], float vmax) {
 
 
 
-/*
- Current state of the stepper algorithm
- 
-*/
-
-typedef struct {
-    stepper_block_t *current_block;
-    int32_t accu[MAX_AXIS];         //Bresenham accumulator
-    
-    uint32_t all_step_mask; // binary OR of all step_masks; initialized by stepper_init
-    uint32_t all_dir_mask;  // binary OR of all dir_masks; initialized by stepper_init
-} stepper_status_t;
-
-static stepper_status_t st;
-
-
-/*
- Hardware configuration of the machine: I/O mapping of the axes
-*/
-stepper_config_t stepper_config = {
-    naxis: 2,
-    step_mask: {BIT(22), BIT(24), 0,0,0,0,0,0},
-    dir_mask: {BIT(23), BIT(25), 0,0,0,0,0,0},
-    steps_per_mm: {32.0f*400/40, 32.0f*400/40, 0,0,0,0,0,0},
-    machine_steps_per_mm: STEPS_PER_MM
-};
-char* stepper_config_structdef = "naxis:I,step_mask:8I,dir_mask:8I,machine_steps_per_mm:f";
 
 
 void stepper_init(void) {
@@ -279,68 +299,6 @@ void stepper_init(void) {
     memset(&block, 0, sizeof(stepper_block_t));
     stepper_put_buffer(&block);
     st.current_block = &buffer[0];
-    
-    float target[MAX_AXIS];
-    
-    /* testing code */
-    for(int i=0;i<4;i++) {
-        break;
-        target[0] = 80;
-        target[1] = 0;
-        stepper_queuemove(target, 80.0f);
-        if(i==1) break;
-        target[0] = 82;
-        stepper_queuemove(target, 80.0f);
-        target[0] = 160;
-        stepper_queuemove(target, 20.0f);
-        target[1] = 160;
-        stepper_queuemove(target, 80.0f);
-        target[0] = 200;
-        target[1] = 160;
-        stepper_queuemove(target, 80.0f);
-        
-    
-/*        block.direction_bits = stepper_config.dir_mask[0] | stepper_config.dir_mask[1];
-        block.steps[0] = 20000;
-        block.steps[1] = 0;
-        block.total_steps = 20000;
-        block.vmax_sq = sq(vmax);
-        block.vmax_entry_sq = 0;
-        stepper_put_buffer(&block);
-        //if (i == 1) break;
-        block.direction_bits = stepper_config.dir_mask[0] | stepper_config.dir_mask[1];
-        block.steps[0] = 200;
-        block.steps[1] = 0;
-        block.total_steps = 200;
-        block.vmax_sq = sq(vmax);
-        block.vmax_entry_sq = sq(vmax);
-        stepper_put_buffer(&block);
-        
-        block.direction_bits = stepper_config.dir_mask[0] | stepper_config.dir_mask[1];
-        block.steps[0] = 10000;
-        block.steps[1] = 0;
-        block.total_steps = 10000;
-        block.vmax_sq = sq(vmax)/16;
-        block.vmax_entry_sq = sq(vmax)/16;
-        stepper_put_buffer(&block);
-        
-        block.direction_bits = stepper_config.dir_mask[0] | stepper_config.dir_mask[1];
-        block.steps[0] = 0;
-        block.steps[1] = 20000;
-        block.total_steps = 20000;
-        block.vmax_sq = sq(vmax);
-        block.vmax_entry_sq = 0;
-        stepper_put_buffer(&block);
-    
-        block.direction_bits = 0;
-        block.steps[0] = 20000;
-        block.steps[1] = 20000;
-        block.total_steps = 20000;
-        block.vmax_sq = sq(vmax);
-        block.vmax_entry_sq = 0;
-        stepper_put_buffer(&block);*/
-    }
-    
 
     /* Compute all_step_mask and all_dir_mask, they are the binary OR of all
        step_masks and dir_masks, respectively. These are precomputed for use
@@ -400,6 +358,10 @@ void app_systick(void) {
     static float current_speed = 0;
     unsigned int my_buffer_tail;
     stepper_block_t *bl;
+    
+    // compute amax in steps per (systick_period^2)
+    float amax = stepper_config.max_acceleration  * DT * DT * stepper_config.machine_steps_per_mm;
+
     
     my_buffer_tail = buffer_tail; //atomic copy
     /* FIQ interrupt could update buffer_tail, but data will remain valid

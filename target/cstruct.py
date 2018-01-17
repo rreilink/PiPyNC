@@ -8,21 +8,21 @@ typedef struct {
 import struct
 import array
 
-class Struct:
+class CStruct:
     '''
     Python representation of a C data structure
     
     This could also be done using ctypes.Structure, but that is not (yet)
     available in PyPiOS
     
-    definition is a string like "name/type,name2/type2"
+    definition is a string like "name:type,name2:type2"
     data is a bytearray that contains the data
     '''
     def __init__(self, definition, data):
         format = ''
         def_dict = {} # dictionary of attribute name -> (size, offset, type)
         for item in definition.split(','):
-            name, sep, type = item.rpartition('/')
+            name, sep, type = item.rpartition(':')
             
             # format = total format upto now, to calculate offset, taking into
             # account alignment          
@@ -33,15 +33,17 @@ class Struct:
             def_dict[name] = offset, size, type
             
 
-        assert struct.calcsize(format) == len(data)
+        if struct.calcsize(format) != len(data):
+            print(format, struct.calcsize(format), len(data))
+            assert False
         
-        self.__dict__['_Struct__def'] = def_dict
-        self.__dict__['_Struct__data'] = data
+        self.__dict__['_CStruct__def'] = def_dict
+        self.__dict__['_CStruct__data'] = data
         
     def __getattr__(self, attr):
         try:
             offset, size, type = self.__def[attr]
-        except KeyxError:
+        except KeyError:
             raise AttributeError
         
         if type[0].isdigit():
@@ -75,10 +77,9 @@ class Struct:
        
     
     
-         
-config_defi = [('naxis', 'I'), ('step_mask', '8I'), ('dir_mask', '8I')]
-config_defi = 'naxis/I,step_mask/8I,dir_mask/8I'
-config_data = bytearray(68)
-s = Struct(config_defi, config_data)
+        
+config_defi = 'naxis:I,step_mask:8I,dir_mask:8I,steps_per_mm:8f,machine_steps_per_mm:f,max_acceleration:f'
+config_data = bytearray(108)
+s = CStruct(config_defi, config_data)
 
 

@@ -11,8 +11,10 @@ typedef struct {
     int naxis;
     uint32_t step_mask[MAX_AXIS];
     uint32_t dir_mask[MAX_AXIS];
+    int core_axes[2];
     float steps_per_mm[MAX_AXIS];
     float machine_steps_per_mm;
+    float max_acceleration;
 } stepper_config_t;
 
 extern stepper_config_t stepper_config;

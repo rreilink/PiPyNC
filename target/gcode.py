@@ -19,7 +19,7 @@ class GcodeRunner:
         import app
         while True:
             try:
-                app.queuemove((target[0] + target[1])/2, (target[0] - target[1])/2, 100)
+                app.queuemove(((target[0] + target[1])/2, (target[0] - target[1])/2), 100)
             except RuntimeError:
                 pass
             else:
@@ -115,44 +115,7 @@ def runfile(filename):
         for i in r:
             pass
     
-        
-
-class GcodeRunnerPlot(GcodeRunner):
-    def __init__(self, *args, **kwargs):
-        self.lst = []
-        super().__init__(*args, **kwargs)
-    def move(self, target, feed):
-        self.lst.append(target)    
-    
 if __name__ == '__main__':
-    g = GcodeRunnerPlot()
-    with open('/Users/rob/tmp/F_3DBenchy.gcode') as file:
-        g.setsource(file)
-        r = g.runner()
-        for i in r:
-            pass
-    ##
-    from pylab import *   
-    a = np.array(g.lst)
-    s = a[:1000,:]
-    clf()
-    plot(s[:,0], s[:,1])
-    
-    ##
-    
-    d = np.diff(a, axis = 0)
-    dd = np.linalg.norm(d, 2, 1)
-    d = d / dd[:,np.newaxis] # unit vectors
-    
-    cos_th = -(d[1:] * d[:1]).sum(1)
-    cos_th = fmax(-0.99, cos_th)
-    
-    sin_theta_d2 = np.sqrt(0.5*(1-cos_th))
-    junctiondev = 0.1
-    amax = 120000 # mm/s^2
-    vmax_sq = (amax*junctiondev * sin_theta_d2)/(1-sin_theta_d2)
-    
-    figure(2), clf()
-    hist(fmax(sqrt(vmax_sq),100), 1000)
+    runfile('/boot/app/test.gcode')
             
     
