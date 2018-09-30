@@ -19,7 +19,7 @@ class GcodeRunner:
         import app
         while True:
             try:
-                app.queuemove(((target[0] + target[1])/2, (target[0] - target[1])/2), 100)
+                app.queuemove((target[0], target[1]), 100)
             except RuntimeError:
                 pass
             else:

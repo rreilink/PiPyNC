@@ -44,10 +44,11 @@ _app_moveto(PyObject *self, PyObject *args) {
     PyObject *item;
     int i;
     float vmax;
+    unsigned int home_mask;
     
     for(int i=0;i<MAX_AXIS;i++) target_f[i] = 0.0f;
 
-    if (!PyArg_ParseTuple(args, "Of", &target, &vmax)) {
+    if (!PyArg_ParseTuple(args, "Of|I", &target, &vmax, &home_mask)) {
         return NULL;
     } 
 
@@ -81,7 +82,7 @@ _app_moveto(PyObject *self, PyObject *args) {
     Py_DECREF(iter);
     
     // Perform the move
-    if (stepper_queuemove(target_f, vmax)!=0) { // Error
+    if (stepper_queuemove(target_f, vmax, home_mask)!=0) { // Error
         PyErr_SetString(PyExc_RuntimeError, "Queue full");
         return NULL;
     }
@@ -96,33 +97,27 @@ error:
 }
 
 
+extern void stepper_prepare(void);
+extern void stepper_buffer_init(void);
+
 static PyObject *
-_app_moveto2(PyObject *self, PyObject *args) {
-    float target[MAX_AXIS]; // TODO: number of axes
-    int i;
-    float vmax;
-    
-    for(int i=0;i<8;i++) target[i] = 0.0f;
-    
-    if (!PyArg_ParseTuple(args, "fff", &target[0], &target[1], &vmax)) {
-        return NULL;
-    }  
-
-    if (stepper_queuemove(target, vmax)!=0) { // Error
-        PyErr_SetString(PyExc_RuntimeError, "Queue full");
-        return NULL;
-    }
-
+_app_prepare(PyObject *self, PyObject *args) {
+    stepper_prepare();
     Py_RETURN_NONE;
-    
 }
 
+static PyObject *
+_app_abort(PyObject *self, PyObject *args) {
+    stepper_abort();
+    Py_RETURN_NONE;
+}
 
 static PyMethodDef _AppMethods[] = {
     {"getstate", _app_getstate, METH_VARARGS, "Get stepper state"},
     {"setacc", _app_setacceleration, METH_VARARGS, "Set stepper acceleration"},
     {"queuemove", _app_moveto, METH_VARARGS, "Queue movement to given coordinate"},
-    
+    {"abort", _app_abort, METH_NOARGS, "Stop all steppers and flush the stepper queue"},
+    {"prepare", _app_prepare, METH_NOARGS, "Prepare the stepper system"},
     {NULL, NULL, 0, NULL}        /* Sentinel */
 };
 
@@ -179,4 +174,12 @@ PyInit_app(void) {
 error:
     Py_DECREF(module);
     return NULL;
+}
+
+extern PyObject* PyInit_extio(void);
+
+void app_init(void) { 
+    stepper_init_buffer();
+    PyImport_AppendInittab("_app", PyInit_app);
+    PyImport_AppendInittab("extio", PyInit_extio);
 }

@@ -40,7 +40,6 @@
 
 #include "ch.h"
 #include "hal.h"
-#include "bcm2835.h"
 #include <string.h>
 #include <math.h>
 
@@ -49,8 +48,14 @@
 #define BUFFER_SIZE 32
 
 #define DT 0.001f // TODO derive from ChibiOS tick frequency
-#define STEPS_PER_MM (32*400.0f/40.0f)
+#define STEPS_PER_MM (16*400.0f/40.0f)
 
+
+#define AUXENB          (*(volatile uint32_t *)(0x20215004))
+#define AUXSPI1_CNTL0   (*(volatile uint32_t *)(0x20215080))
+#define AUXSPI1_CNTL1   (*(volatile uint32_t *)(0x20215084))
+#define AUXSPI1_STAT    (*(volatile uint32_t *)(0x20215088))
+#define AUXSPI1_IO      (*(volatile uint32_t *)(0x202150A0))
 
 
 typedef struct {
@@ -58,7 +63,8 @@ typedef struct {
     int32_t steps[MAX_AXIS]; // signed since it is also used to calculate delta
     int32_t total_steps;
     int32_t step_position;
-    
+    uint32_t home_mask;    // bit mask of inputs which trigger home (set to 0 for non-homing moves)
+    uint32_t home_state;   // 0 = not yet triggered; 1 = triggered, decellerating; 2 = at standstill
 
     float vmax_sq;       //[(mm/timestep)^2]
     float vmax_entry_sq; //[(mm/timestep)^2]
@@ -76,20 +82,24 @@ typedef struct {
     
     uint32_t all_step_mask; // binary OR of all step_masks; initialized by stepper_init
     uint32_t all_dir_mask;  // binary OR of all dir_masks; initialized by stepper_init
+    uint32_t abort;
+
 } stepper_status_t;
 
-static stepper_status_t st;
+    
+
+static stepper_status_t st = {0};
 /*
  Hardware configuration of the machine: I/O mapping of the axes
 */
 stepper_config_t stepper_config = {
     naxis: 2,
-    step_mask: {BIT(22), BIT(24), 0,0,0,0,0,0},
-    dir_mask: {BIT(23), BIT(25), 0,0,0,0,0,0},
+    step_mask: {BIT(17), BIT(19), 0,0,0,0,0,0},
+    dir_mask: {BIT(16), BIT(18), 0,0,0,0,0,0},
     core_axes: {0, 1},
-    steps_per_mm: {32.0f*400/40, 32.0f*400/40, 0,0,0,0,0,0},
+    steps_per_mm: {16.0f*400/40, 16.0f*400/40, 0,0,0,0,0,0},
     machine_steps_per_mm: STEPS_PER_MM,
-    max_acceleration: 1200.0f,
+    max_acceleration: 50000.0f,
 };
 char* stepper_config_structdef = "naxis:I,step_mask:8I,dir_mask:8I,core_axes:2I,"
                                  "steps_per_mm:8f,machine_steps_per_mm:f,"
@@ -181,10 +191,14 @@ static inline float sq(float x) { return x*x; }
 static inline float maxf(float x, float y) { return (x>y) ? x : y; }
 static inline int32_t maxi(int32_t x, int32_t y) { return (x>y) ? x : y; }
 
-int stepper_queuemove(float target[], float vmax) {
+extern CondVar extio_trigger_cv; // For triggering a new I/O cycle at every systick
+
+int stepper_queuemove(float target[], float vmax, uint32_t home_mask) {
     unsigned int next_head = buffer_next_index(buffer_head);
 
     if (next_head == buffer_tail) return -1; //buffer was full
+    if (st.abort) return -1; // busy aborting
+    
     
     int32_t target_steps[MAX_AXIS];
     int32_t axis_steps;
@@ -258,7 +272,7 @@ int stepper_queuemove(float target[], float vmax) {
     } else {
         float sin_angle_div2;
 
-        cos_angle = maxf(cos_angle, -0.99999f);  // TODO: is max a macro? or what type is it?
+        cos_angle = maxf(cos_angle, -0.99999f);
         sin_angle_div2 = sqrtf(0.5f * (1.0f - cos_angle));
         
         block.vmax_entry_sq = maxf(vmin*vmin,
@@ -275,11 +289,18 @@ int stepper_queuemove(float target[], float vmax) {
         }
     }
     
+    block.home_state = 0;
+    block.home_mask = home_mask;
+    
     // store target_steps and unit_vec if block put into buffer succesfully
     int result;
     result = stepper_put_buffer(&block);
     if (result == 0) {
-        memcpy(prev_move_target_steps, target_steps, sizeof(target_steps));
+        if (home_mask) { // ugly: if any of the axes is homed, zero all axes. Good enough for now
+            memset(prev_move_target_steps, 0, sizeof(prev_move_target_steps));
+        } else {
+            memcpy(prev_move_target_steps, target_steps, sizeof(target_steps));
+        }
         memcpy(prev_move_unit_vec, unit_vec, sizeof(unit_vec));
     }
     return result;
@@ -289,7 +310,7 @@ int stepper_queuemove(float target[], float vmax) {
 
 
 
-void stepper_init(void) {
+void stepper_init_buffer(void) {
     /* Initialize buffer */
     buffer_head = 0;
     buffer_tail = 0;
@@ -299,7 +320,17 @@ void stepper_init(void) {
     memset(&block, 0, sizeof(stepper_block_t));
     stepper_put_buffer(&block);
     st.current_block = &buffer[0];
+    
+    /* Initialize I/O trigger condition variable */
+    chCondInit(&extio_trigger_cv);
+}
 
+static inline void dmb(void) {
+    __asm__ __volatile__ ("mcr p15, 0, %0, c7, c10, 5" : : "r" (0) : "memory");
+}
+
+
+void stepper_prepare(void) {
     /* Compute all_step_mask and all_dir_mask, they are the binary OR of all
        step_masks and dir_masks, respectively. These are precomputed for use
        by the step-generator.
@@ -310,12 +341,26 @@ void stepper_init(void) {
         st.all_step_mask |= stepper_config.step_mask[i];
         st.all_dir_mask |= stepper_config.dir_mask[i];
     }
+    st.abort = 0;
     
+    dmb();
+    /* Init SPI1 */
+    AUXENB = AUXENB | 2; // Enable SPI1
+
+    const uint32_t divider = ((250000000/2) / 10000000)-1;
+    const uint32_t config = (divider<<20) | ((7-2)<<17) | (2<<12) | (1<<11) | (1<<8) | (1<<6) | 16;
+    AUXSPI1_CNTL0 = config | (1<<9); // clear fifos
+    AUXSPI1_CNTL0 = config;
+    AUXSPI1_CNTL1 = 0<<8;
     
-    GPCLR0 = st.all_step_mask | st.all_dir_mask;
+    dmb();
     
-    palSetGroupMode(&IOPORT0, st.all_step_mask | st.all_dir_mask, 0, PAL_MODE_OUTPUT);
+    bcm2835_gpio_fnsel(17, GPFN_ALT4);
+    bcm2835_gpio_fnsel(20, GPFN_ALT4);
+    bcm2835_gpio_fnsel(21, GPFN_ALT4);
     
+    dmb();
+    /* Init ARM_TIMER (used for stepping) */
     ARM_TIMER_CTL = 0x003E0000;
     ARM_TIMER_LOD = 1000-1;
     ARM_TIMER_RLD = 1000-1;
@@ -324,17 +369,21 @@ void stepper_init(void) {
     ARM_TIMER_CTL = 0x003E00A2;
     
     IRQ_FIQ_CONTROL = 0x80|64; //ARM timer interrupt = FIQ interrupt
-
+    dmb();
 }
 
+/* Stepper abort
+ *
+ * Decellerate to stop and flush the buffer. Current position is lost; the
+ * position at which the motion stops is the new (0,0,...)
+ *
+ */
+void stepper_abort(void) {
+    st.abort = 1;
+    memset(prev_move_target_steps, 0, sizeof(prev_move_target_steps));
+    memset(prev_move_unit_vec, 0, sizeof(prev_move_unit_vec));
 
-void app_init(void) { stepper_init(); }
-
-static inline void dmb(void) {
-    __asm__ __volatile__ ("mcr p15, 0, %0, c7, c10, 5" : : "r" (0) : "memory");
 }
-
-
 
 
 
@@ -375,13 +424,32 @@ void app_systick(void) {
     float new_speed_sq;       // Lowest speed limit found so far
     float speed_limit_sq;     // Temporary: calculation of a speed limit for a given section
     
-    // default: maximum acceleration
-    new_speed_sq = sq(current_speed + amax);
-
     // Find the current block, and the number of steps still to go in that block
     bl = &buffer[my_buffer_tail];
     cumulative_steps = bl->total_steps - bl->step_position;
+
+    // Check home switch triggered
+    if ((bl->home_mask & GPLEV0) && (bl->home_state == 0)) {
+        bl->home_state = 1;
+    }
     
+    // Check request for decelleration
+    if (st.abort || bl->home_state) {
+        new_speed_sq = sq(maxf(0, current_speed - amax));
+    }  else {
+        // default: maximum acceleration
+        new_speed_sq = sq(current_speed + amax);
+    }
+    
+    // Triggers for FiqHandler when decellerated to 0
+    if (new_speed_sq == 0) {
+        if (st.abort == 1) {
+            st.abort = 2;
+        } else if (bl->home_state == 1) {
+            bl->home_state = 2;
+        }
+    }
+
     // do not accelerate beyond this block's max velocity
     new_speed_sq = limit(new_speed_sq, bl->vmax_sq);
     
@@ -420,6 +488,9 @@ void app_systick(void) {
     }
     
     ARM_TIMER_RLD = reload_value;
+    
+    // Trigger new I/O cycle
+    chCondBroadcastI(&extio_trigger_cv);
 }
 
 
@@ -428,20 +499,33 @@ void FiqHandler(void) {
     // FIQ handler init code; push all registers that are shared with other
     // modes than FIQ mode
     asm volatile ("stmfd    sp!, {r0-r7, r12, lr}" : : : "memory");
-    dmb();
     
     uint32_t step_mask;
     stepper_block_t *bl;
     
-    // All step signals low
-    GPCLR0 = st.all_step_mask;
-    
+    if (st.abort == 2) { // Decelleration done; purge buffer
+        // Move buffer_tail such that there is exactly one item in the buffer
+        // (buffer never gets empty)
+        if (buffer_head == 0) {
+            buffer_tail = BUFFER_SIZE - 1;
+        } else {
+            buffer_tail = buffer_head - 1;
+        }
+        
+        // Indicate that the last block remaining is the current one, and that
+        // it is finished
+        bl = st.current_block = &buffer[buffer_tail];
+        bl->step_position = bl->total_steps;
+        st.abort = 0; // abort done
+    }
+
     // Get next block, if required
     bl =  st.current_block;
-    if (bl->step_position == bl->total_steps) {
+    if ((bl->step_position == bl->total_steps) || (bl->home_state == 2)) {
         unsigned int next_tail = buffer_next_index(buffer_tail);
         if (next_tail == buffer_head) {
             // would pop the last item, we do not do that
+            bl->step_position = bl->total_steps; // mark block as done (in case of bl->home_state == 2)
         } else {
             // no need to worry about consistency; FIQ cannot be interrupted
             buffer_tail = next_tail;
@@ -450,10 +534,6 @@ void FiqHandler(void) {
             for (int i = 0; i< stepper_config.naxis; i++) {
                 st.accu[i]=-accu_init;
             }
-            
-            // Set direction signals
-            GPCLR0 = st.all_dir_mask & ~bl->direction_bits;    
-            GPSET0 = bl->direction_bits;
         }
     }
     
@@ -474,13 +554,16 @@ void FiqHandler(void) {
         bl->step_position = bl->step_position + 1;
     }
     dmb();
-    // Wait until pulse length has elapsed
+    // Wait until some time has elapsed, otherwise clearing the interrupt flag fails
     uint32_t wait_val = ARM_TIMER_RLD - 2; //2 us pulse length
     while(ARM_TIMER_VAL > wait_val); 
 
     ARM_TIMER_CLI = 0;
     dmb();
-    GPSET0 = step_mask; // generate step pulse
+    
+    // Load two SPI transfers into the SPI peripheral:
+    AUXSPI1_IO = bl->direction_bits;                // clear all step bits; set-up direction
+    AUXSPI1_IO = bl->direction_bits | step_mask;    // set apropriate step bits
     
     
     // FIQ handler exit code
