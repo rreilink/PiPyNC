@@ -490,7 +490,7 @@ void app_systick(void) {
     ARM_TIMER_RLD = reload_value;
     
     // Trigger new I/O cycle
-    chCondBroadcastI(&extio_trigger_cv);
+    //chCondBroadcastI(&extio_trigger_cv);
 }
 
 

@@ -181,5 +181,5 @@ extern PyObject* PyInit_extio(void);
 void app_init(void) { 
     stepper_init_buffer();
     PyImport_AppendInittab("_app", PyInit_app);
-    PyImport_AppendInittab("extio", PyInit_extio);
+    PyImport_AppendInittab("_extio", PyInit_extio);
 }
